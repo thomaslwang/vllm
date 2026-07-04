@@ -63,6 +63,15 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     return kv_cache_spec
 
 
+def _cache_dtype_for_kv_cache_spec(
+    kv_cache_spec: AttentionSpec, cache_dtype: str
+) -> str:
+    spec_cache_dtype = getattr(kv_cache_spec, "cache_dtype_str", None)
+    if spec_cache_dtype is not None:
+        return spec_cache_dtype
+    return "auto" if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE else cache_dtype
+
+
 def get_shared_kv_cache_layers(vllm_config: VllmConfig):
     attn_layers = get_layers_from_vllm_config(vllm_config, Attention)
     return {
@@ -304,10 +313,8 @@ def _reshape_kv_cache(
                 # Skipped layers (--kv-cache-dtype-skip-layers) keep the
                 # unquantized shape; only the quantized primary uses the
                 # quantized cache dtype's (possibly packed) layout.
-                layer_cache_dtype = (
-                    "auto"
-                    if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
-                    else cache_dtype
+                layer_cache_dtype = _cache_dtype_for_kv_cache_spec(
+                    kv_cache_spec, cache_dtype
                 )
                 kv_cache_shape = group.backend.get_kv_cache_shape(
                     kernel_num_blocks,
@@ -390,9 +397,7 @@ def _update_hybrid_attention_layout(
         # above. The block-dim index is dtype-independent for current backends
         # (quantization only changes the last dim), so this is a no-op today,
         # but it keeps both call sites consistent for skip layers.
-        layer_cache_dtype = (
-            "auto" if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE else cache_dtype
-        )
+        layer_cache_dtype = _cache_dtype_for_kv_cache_spec(kv_cache_spec, cache_dtype)
         block_dim = group.backend.get_kv_cache_block_dim(
             kernel_block_sizes[group.kv_cache_group_id],
             kv_cache_spec.num_kv_heads,
