@@ -35,16 +35,31 @@ _MAX_ELEMS = 64 * 1024  # 128KB bf16 cap; decode messages are ~8-32KB
 
 
 @triton.jit
+def _fence_sys(dummy):
+    """System-scope acq_rel fence (PCIe P2P has no native remote atomics,
+    so signaling uses plain remote stores bracketed by this fence)."""
+    return tl.inline_asm_elementwise(
+        "fence.acq_rel.sys; mov.u32 $0, $1;",
+        "=r,r",
+        [dummy],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
 def _hier_all_reduce_kernel(
     inp_ptr,
     out_ptr,
     ptrs_ptr,  # [world] int64 device pointers to each rank's data slot
     partial_ptrs_ptr,  # [world] int64 pointers to each rank's partial slot
-    flag_ptrs_ptr,  # [world] int64 pointers to each rank's flag pair
+    flag_ptrs_ptr,  # [world] int64 pointers to each rank's flag array
     rank: tl.constexpr,
     island_base: tl.constexpr,  # first rank of this island
     island_size: tl.constexpr,
     counterpart: tl.constexpr,  # same-index rank in the other island
+    WORLD: tl.constexpr,
     numel,
     token_ptr,  # device-side int32 sequence counter (cudagraph-safe)
     MAX_ELEMS: tl.constexpr,
@@ -66,30 +81,46 @@ def _hier_all_reduce_kernel(
         tl.cast(tl.load(partial_ptrs_ptr + rank), tl.pointer_type(tl.float32))
         + buf_off
     )
+    # Flag layout per rank: [phase (2) x writer rank (WORLD)]. Writers push
+    # tokens into the READER's local array with plain remote stores; readers
+    # spin on local memory only (remote polling costs a PCIe round trip per
+    # iteration and remote atomics are not native over PCIe).
     my_flags = tl.cast(
         tl.load(flag_ptrs_ptr + rank), tl.pointer_type(tl.int32)
     )
 
-    # Phase A: publish the whole input, then raise the phase-A flag once.
+    # Phase A: publish the whole input locally, then signal island peers.
     for off in range(0, numel, BLOCK):
         offs = off + tl.arange(0, BLOCK)
         mask = offs < numel
         x = tl.load(inp_ptr + offs, mask=mask, other=0.0)
         tl.store(my_slot + offs, x, mask=mask)
     tl.debug_barrier()
-    tl.atomic_xchg(my_flags + 0, token, sem="release")
-
-    # Wait for all island peers' phase-A flags (once, before touching data).
+    _fence_sys(0)
     for i in tl.static_range(island_size):
         peer = island_base + i
         if peer != rank:
             peer_flags = tl.cast(
                 tl.load(flag_ptrs_ptr + peer), tl.pointer_type(tl.int32)
             )
-            while tl.atomic_add(peer_flags + 0, 0, sem="acquire") < token:
-                pass
+            tl.store(peer_flags + 0 * WORLD + rank, token)
 
-    # Phase B: island reduce over P2P, publish partial, raise phase-B flag.
+    # Wait for all island peers' phase-A signals (local spin).
+    for i in tl.static_range(island_size):
+        peer = island_base + i
+        if peer != rank:
+            while (
+                tl.atomic_add(
+                    my_flags + 0 * WORLD + peer, 0, sem="acquire", scope="sys"
+                )
+                < token
+            ):
+                pass
+    _fence_sys(0)
+    tl.debug_barrier()
+
+    # Phase B: island reduce over P2P reads, publish partial, signal
+    # the cross-island counterpart.
     for off in range(0, numel, BLOCK):
         offs = off + tl.arange(0, BLOCK)
         mask = offs < numel
@@ -109,14 +140,23 @@ def _hier_all_reduce_kernel(
                 )
         tl.store(my_partial + offs, acc, mask=mask)
     tl.debug_barrier()
-    tl.atomic_xchg(my_flags + 1, token, sem="release")
-
-    # Phase C: single cross-island exchange with the counterpart rank.
+    _fence_sys(0)
     cp_flags = tl.cast(
         tl.load(flag_ptrs_ptr + counterpart), tl.pointer_type(tl.int32)
     )
-    while tl.atomic_add(cp_flags + 1, 0, sem="acquire") < token:
+    tl.store(cp_flags + 1 * WORLD + rank, token)
+
+    # Phase C: wait for the counterpart's phase-B signal (local spin), then
+    # do the single cross-island exchange.
+    while (
+        tl.atomic_add(
+            my_flags + 1 * WORLD + counterpart, 0, sem="acquire", scope="sys"
+        )
+        < token
+    ):
         pass
+    _fence_sys(0)
+    tl.debug_barrier()
     cp_partial = (
         tl.cast(
             tl.load(partial_ptrs_ptr + counterpart),
@@ -167,7 +207,9 @@ class HierarchicalAllReduce:
         # data slot (bf16), partial slot (fp32), flags (2 x int32)
         self._data = torch.zeros(2 * _MAX_ELEMS, dtype=torch.bfloat16, device=device)
         self._partial = torch.zeros(2 * _MAX_ELEMS, dtype=torch.float32, device=device)
-        self._flags = torch.zeros(8, dtype=torch.int32, device=device)
+        self._flags = torch.zeros(
+            2 * self.world_size, dtype=torch.int32, device=device
+        )
         self._token_ctr = torch.zeros(1, dtype=torch.int32, device=device)
 
         self._data_ptrs = self._exchange_ptrs(self._data)
@@ -219,6 +261,7 @@ class HierarchicalAllReduce:
             island_base=self.island_base,
             island_size=self.island_size,
             counterpart=self.counterpart,
+            WORLD=self.world_size,
             numel=numel,
             token_ptr=self._token_ctr,
             MAX_ELEMS=_MAX_ELEMS,
