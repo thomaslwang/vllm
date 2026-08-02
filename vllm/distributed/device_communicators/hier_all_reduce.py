@@ -21,6 +21,9 @@ should stay on NCCL. Buffers are IPC-registered once; flags use monotonically
 increasing sequence tokens so no zeroing is needed between calls.
 """
 
+import ctypes
+import glob
+import os
 from collections.abc import Sequence
 
 import torch
@@ -31,7 +34,61 @@ from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
-_MAX_ELEMS = 64 * 1024  # 128KB bf16 cap; decode messages are ~8-32KB
+_MAX_ELEMS = 64 * 1024  # 128KB bf16 cap; decode messages are ~8-48KB
+_MAX_CTA = 16
+
+
+class _IpcHandle(ctypes.Structure):
+    _fields_ = [("reserved", ctypes.c_char * 64)]
+
+
+_cudart = None
+
+
+def _get_cudart():
+    """The shared buffers are cudaMalloc'd and IPC-opened via ctypes: torch
+    opens IPC handles inside the OWNER's device context, so the mapping is
+    never made peer-accessible to the importing device's kernels."""
+    global _cudart
+    if _cudart is None:
+        tdir = os.path.dirname(torch.__file__)
+        cands = glob.glob(
+            os.path.join(
+                os.path.dirname(tdir),
+                "nvidia",
+                "cuda_runtime",
+                "lib",
+                "libcudart.so*",
+            )
+        ) + glob.glob(os.path.join(tdir, "lib", "libcudart*.so*"))
+        lib = ctypes.CDLL(cands[0])
+        lib.cudaMalloc.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_size_t,
+        ]
+        lib.cudaMemset.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_size_t,
+        ]
+        lib.cudaIpcGetMemHandle.argtypes = [
+            ctypes.POINTER(_IpcHandle),
+            ctypes.c_void_p,
+        ]
+        lib.cudaIpcOpenMemHandle.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            _IpcHandle,
+            ctypes.c_uint,
+        ]
+        lib.cudaIpcCloseMemHandle.argtypes = [ctypes.c_void_p]
+        lib.cudaFree.argtypes = [ctypes.c_void_p]
+        _cudart = lib
+    return _cudart
+
+
+def _check(rc: int, what: str) -> None:
+    if rc != 0:
+        raise RuntimeError(f"{what} failed: cudaError {rc}")
 
 
 @triton.jit
@@ -61,38 +118,45 @@ def _hier_all_reduce_kernel(
     counterpart: tl.constexpr,  # same-index rank in the other island
     WORLD: tl.constexpr,
     numel,
-    token_ptr,  # device-side int32 sequence counter (cudagraph-safe)
+    token_ptr,  # [MAX_CTA] device int32 sequence counters (cudagraph-safe)
     MAX_ELEMS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    # Derive the sequence token on-device so graph replays stay ordered:
-    # every rank launches this kernel once per collective call, so local
-    # fetch-and-increment counters advance in lockstep across ranks.
-    token = tl.atomic_add(token_ptr, 1, sem="relaxed") + 1
+    # Each CTA owns a disjoint chunk with its own flag row and sequence
+    # counter; chunks synchronize independently, so multiple CTAs keep
+    # multiple PCIe read streams in flight (single-CTA queue depth is the
+    # bandwidth bottleneck at >=32KB).
+    pid = tl.program_id(0)
+    ncta = tl.num_programs(0)
+    token = tl.atomic_add(token_ptr + pid, 1, sem="relaxed") + 1
+    chunk = tl.cdiv(numel, ncta)
+    start = pid * chunk
+    end = tl.minimum(numel, start + chunk)
+    fbase = pid * 2 * WORLD
+
     # Double-buffer data/partial slots by token parity: a rank can lap a
-    # slow peer by one call, but program order plus the flag waits make a
-    # two-call lap (same-parity reuse) impossible before the peer's read.
+    # slow peer by one call, but launch-granularity stream ordering plus
+    # the flag waits make a two-call lap (same-parity reuse) impossible
+    # before the peer's read.
     buf_off = (token % 2) * MAX_ELEMS
     my_slot = (
         tl.cast(tl.load(ptrs_ptr + rank), tl.pointer_type(tl.bfloat16))
         + buf_off
     )
     my_partial = (
-        tl.cast(tl.load(partial_ptrs_ptr + rank), tl.pointer_type(tl.float32))
+        tl.cast(
+            tl.load(partial_ptrs_ptr + rank), tl.pointer_type(tl.bfloat16)
+        )
         + buf_off
     )
-    # Flag layout per rank: [phase (2) x writer rank (WORLD)]. Writers push
-    # tokens into the READER's local array with plain remote stores; readers
-    # spin on local memory only (remote polling costs a PCIe round trip per
-    # iteration and remote atomics are not native over PCIe).
     my_flags = tl.cast(
         tl.load(flag_ptrs_ptr + rank), tl.pointer_type(tl.int32)
     )
 
-    # Phase A: publish the whole input locally, then signal island peers.
-    for off in range(0, numel, BLOCK):
+    # Phase A: publish this chunk locally, then signal island peers.
+    for off in range(start, end, BLOCK):
         offs = off + tl.arange(0, BLOCK)
-        mask = offs < numel
+        mask = offs < end
         x = tl.load(inp_ptr + offs, mask=mask, other=0.0)
         tl.store(my_slot + offs, x, mask=mask)
     tl.debug_barrier()
@@ -103,15 +167,18 @@ def _hier_all_reduce_kernel(
             peer_flags = tl.cast(
                 tl.load(flag_ptrs_ptr + peer), tl.pointer_type(tl.int32)
             )
-            tl.store(peer_flags + 0 * WORLD + rank, token)
+            tl.store(peer_flags + fbase + 0 * WORLD + rank, token)
 
-    # Wait for all island peers' phase-A signals (local spin).
+    # Wait for the island peers' phase-A signals for this chunk.
     for i in tl.static_range(island_size):
         peer = island_base + i
         if peer != rank:
             while (
                 tl.atomic_add(
-                    my_flags + 0 * WORLD + peer, 0, sem="acquire", scope="sys"
+                    my_flags + fbase + 0 * WORLD + peer,
+                    0,
+                    sem="acquire",
+                    scope="sys",
                 )
                 < token
             ):
@@ -119,11 +186,12 @@ def _hier_all_reduce_kernel(
     _fence_sys(0)
     tl.debug_barrier()
 
-    # Phase B: island reduce over P2P reads, publish partial, signal
-    # the cross-island counterpart.
-    for off in range(0, numel, BLOCK):
+    # Phase B: island reduce over P2P reads, publish partial, signal the
+    # cross-island counterpart. Partials are bf16 to halve cross-island
+    # bytes; accumulation stays fp32.
+    for off in range(start, end, BLOCK):
         offs = off + tl.arange(0, BLOCK)
-        mask = offs < numel
+        mask = offs < end
         acc = tl.load(my_slot + offs, mask=mask, other=0.0).to(tl.float32)
         for i in tl.static_range(island_size):
             peer = island_base + i
@@ -138,19 +206,22 @@ def _hier_all_reduce_kernel(
                 acc += tl.load(peer_slot + offs, mask=mask, other=0.0).to(
                     tl.float32
                 )
-        tl.store(my_partial + offs, acc, mask=mask)
+        tl.store(my_partial + offs, acc.to(tl.bfloat16), mask=mask)
     tl.debug_barrier()
     _fence_sys(0)
     cp_flags = tl.cast(
         tl.load(flag_ptrs_ptr + counterpart), tl.pointer_type(tl.int32)
     )
-    tl.store(cp_flags + 1 * WORLD + rank, token)
+    tl.store(cp_flags + fbase + 1 * WORLD + rank, token)
 
-    # Phase C: wait for the counterpart's phase-B signal (local spin), then
-    # do the single cross-island exchange.
+    # Phase C: wait for the counterpart's phase-B signal for this chunk,
+    # then do the single cross-island exchange.
     while (
         tl.atomic_add(
-            my_flags + 1 * WORLD + counterpart, 0, sem="acquire", scope="sys"
+            my_flags + fbase + 1 * WORLD + counterpart,
+            0,
+            sem="acquire",
+            scope="sys",
         )
         < token
     ):
@@ -160,15 +231,15 @@ def _hier_all_reduce_kernel(
     cp_partial = (
         tl.cast(
             tl.load(partial_ptrs_ptr + counterpart),
-            tl.pointer_type(tl.float32),
+            tl.pointer_type(tl.bfloat16),
         )
         + buf_off
     )
-    for off in range(0, numel, BLOCK):
+    for off in range(start, end, BLOCK):
         offs = off + tl.arange(0, BLOCK)
-        mask = offs < numel
-        acc = tl.load(my_partial + offs, mask=mask, other=0.0)
-        acc += tl.load(cp_partial + offs, mask=mask, other=0.0)
+        mask = offs < end
+        acc = tl.load(my_partial + offs, mask=mask, other=0.0).to(tl.float32)
+        acc += tl.load(cp_partial + offs, mask=mask, other=0.0).to(tl.float32)
         tl.store(out_ptr + offs, acc.to(tl.bfloat16), mask=mask)
 
 
@@ -204,54 +275,91 @@ class HierarchicalAllReduce:
         self.island_size = len(island)
         self.counterpart = other[island.index(me)]
 
-        # data slot (bf16), partial slot (fp32), flags (2 x int32)
-        self._data = torch.zeros(2 * _MAX_ELEMS, dtype=torch.bfloat16, device=device)
-        self._partial = torch.zeros(2 * _MAX_ELEMS, dtype=torch.float32, device=device)
-        self._flags = torch.zeros(
-            2 * self.world_size, dtype=torch.int32, device=device
+        rt = _get_cudart()
+        _check(rt.cudaSetDevice(ctypes.c_int(device.index)), "cudaSetDevice")
+        self._own = []
+        self._opened = []
+        # data slots (bf16), partial slots (fp32) — double-buffered; flags
+        # [phase(2) x writer(world)] int32
+        data_ptr = self._alloc(rt, 2 * _MAX_ELEMS * 2)
+        partial_ptr = self._alloc(rt, 2 * _MAX_ELEMS * 2)
+        flags_ptr = self._alloc(rt, _MAX_CTA * 2 * self.world_size * 4)
+        self._token_ctr = torch.zeros(
+            _MAX_CTA, dtype=torch.int32, device=device
         )
-        self._token_ctr = torch.zeros(1, dtype=torch.int32, device=device)
 
-        self._data_ptrs = self._exchange_ptrs(self._data)
-        self._partial_ptrs = self._exchange_ptrs(self._partial)
-        self._flag_ptrs = self._exchange_ptrs(self._flags)
+        self._data_ptrs = self._exchange_ptrs(rt, data_ptr)
+        self._partial_ptrs = self._exchange_ptrs(rt, partial_ptr)
+        self._flag_ptrs = self._exchange_ptrs(rt, flags_ptr)
 
-    def _exchange_ptrs(self, t: torch.Tensor) -> torch.Tensor:
-        """Share `t` with all ranks via CUDA IPC; return device ptr array."""
-        from torch.multiprocessing.reductions import rebuild_cuda_tensor
+    def _alloc(self, rt, nbytes: int) -> int:
+        ptr = ctypes.c_void_p()
+        _check(rt.cudaMalloc(ctypes.byref(ptr), nbytes), "cudaMalloc")
+        _check(rt.cudaMemset(ptr, 0, nbytes), "cudaMemset")
+        self._own.append(ptr.value)
+        return ptr.value
 
-        handle_info = t.untyped_storage()._share_cuda_()
-        obj_list = [None] * self.world_size
-        dist.all_gather_object(obj_list, (self.rank, handle_info, t.dtype, t.numel()), group=self.group)
-        ptrs = torch.zeros(self.world_size, dtype=torch.int64, device=self.device)
-        opened = []
-        for rank, info, dtype, numel in obj_list:
+    def _exchange_ptrs(self, rt, local_ptr: int) -> torch.Tensor:
+        """Share a raw device allocation with all ranks via CUDA IPC and
+        return a device tensor of every rank's pointer. Handles are opened
+        with the importing device current so lazy peer access covers our
+        kernels' direct loads/stores."""
+        handle = _IpcHandle()
+        _check(
+            rt.cudaIpcGetMemHandle(
+                ctypes.byref(handle), ctypes.c_void_p(local_ptr)
+            ),
+            "cudaIpcGetMemHandle",
+        )
+        objs: list = [None] * self.world_size
+        dist.all_gather_object(
+            objs, (self.rank, bytes(handle)), group=self.group
+        )
+        ptrs = torch.zeros(
+            self.world_size, dtype=torch.int64, device=self.device
+        )
+        for rank, hbytes in objs:
             if rank == self.rank:
-                ptrs[rank] = t.data_ptr()
+                ptrs[rank] = local_ptr
                 continue
-            storage = type(t.untyped_storage())._new_shared_cuda(*info)
-            peer_t = torch.tensor([], dtype=dtype, device=self.device).set_(
-                storage
+            h = _IpcHandle.from_buffer_copy(hbytes)
+            peer_ptr = ctypes.c_void_p()
+            _check(
+                rt.cudaIpcOpenMemHandle(
+                    ctypes.byref(peer_ptr), h, ctypes.c_uint(1)
+                ),
+                "cudaIpcOpenMemHandle",
             )
-            opened.append(peer_t)
-            ptrs[rank] = peer_t.data_ptr()
-        if not hasattr(self, "_opened"):
-            self._opened = []
-        self._opened.extend(opened)
+            self._opened.append(peer_ptr.value)
+            ptrs[rank] = peer_ptr.value
         return ptrs
 
+    def __del__(self):
+        try:
+            rt = _get_cudart()
+            for ptr in getattr(self, "_opened", []):
+                rt.cudaIpcCloseMemHandle(ctypes.c_void_p(ptr))
+            for ptr in getattr(self, "_own", []):
+                rt.cudaFree(ctypes.c_void_p(ptr))
+        except Exception:
+            pass
+
     def should_use(self, inp: torch.Tensor) -> bool:
+        # Above ~48KB NCCL switches to a bandwidth-efficient protocol that
+        # beats the one-shot read design; below it, local measurements on
+        # 2x4 A800 PCIe show 1.15-1.3x wins.
         return (
             inp.dtype == torch.bfloat16
             and inp.is_contiguous()
-            and inp.numel() <= _MAX_ELEMS
+            and inp.numel() <= 24 * 1024
         )
 
     def all_reduce(self, inp: torch.Tensor, out: torch.Tensor | None = None):
         if out is None:
             out = torch.empty_like(inp)
         numel = inp.numel()
-        _hier_all_reduce_kernel[(1,)](
+        ncta = min(_MAX_CTA, max(1, (numel + 4095) // 4096))
+        _hier_all_reduce_kernel[(ncta,)](
             inp.view(-1),
             out.view(-1),
             self._data_ptrs,
@@ -266,6 +374,6 @@ class HierarchicalAllReduce:
             token_ptr=self._token_ctr,
             MAX_ELEMS=_MAX_ELEMS,
             BLOCK=min(8192, triton.next_power_of_2(numel)),
-            num_warps=16,
+            num_warps=8,
         )
         return out
