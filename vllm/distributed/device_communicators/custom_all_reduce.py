@@ -176,13 +176,21 @@ class CustomAllreduce:
             physical_device_ids = [t.item() for t in gather_list]
             assert current_platform.is_cuda_alike()
             fully_connected = current_platform.is_fully_connected(physical_device_ids)
+        self.pcie_override = envs.VLLM_PCIE_CUSTOM_ALL_REDUCE
         if same_node and world_size > 2 and not fully_connected:
-            logger.warning(
-                "Custom allreduce is disabled because it's not supported on"
-                " more than two PCIe-only GPUs. To silence this warning, "
-                "specify disable_custom_all_reduce=True explicitly."
-            )
-            return
+            if self.pcie_override:
+                logger.warning_once(
+                    "Enabling custom allreduce on a PCIe-only topology "
+                    "(VLLM_PCIE_CUSTOM_ALL_REDUCE=1). Small-message latency "
+                    "optimization; large payloads still go through NCCL."
+                )
+            else:
+                logger.warning(
+                    "Custom allreduce is disabled because it's not supported on"
+                    " more than two PCIe-only GPUs. To silence this warning, "
+                    "specify disable_custom_all_reduce=True explicitly."
+                )
+                return
         # test P2P capability, this checks software/cudaruntime support
         # this is expensive to compute at the first time
         # then we cache the result
@@ -358,6 +366,10 @@ class CustomAllreduce:
         # little performance improvement over NCCL.
         if self.world_size == 2 or self.fully_connected:
             return inp_size < self.max_size
+        if getattr(self, "pcie_override", False):
+            # Latency-bound regime only: decode-sized messages win over the
+            # NCCL ring on PCIe; bandwidth-bound payloads do not.
+            return inp_size <= 256 * 1024
         return False
 
     def all_reduce(
