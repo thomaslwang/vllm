@@ -46,9 +46,13 @@ def _hier_all_reduce_kernel(
     island_size: tl.constexpr,
     counterpart: tl.constexpr,  # same-index rank in the other island
     numel,
-    token,  # sequence token for this call (int32, monotonically increasing)
+    token_ptr,  # device-side int32 sequence counter (cudagraph-safe)
     BLOCK: tl.constexpr,
 ):
+    # Derive the sequence token on-device so graph replays stay ordered:
+    # every rank launches this kernel once per collective call, so local
+    # fetch-and-increment counters advance in lockstep across ranks.
+    token = tl.atomic_add(token_ptr, 1, sem="relaxed") + 1
     my_slot = tl.cast(tl.load(ptrs_ptr + rank), tl.pointer_type(tl.bfloat16))
     my_partial = tl.cast(
         tl.load(partial_ptrs_ptr + rank), tl.pointer_type(tl.float32)
@@ -147,7 +151,7 @@ class HierarchicalAllReduce:
         self._data = torch.zeros(_MAX_ELEMS, dtype=torch.bfloat16, device=device)
         self._partial = torch.zeros(_MAX_ELEMS, dtype=torch.float32, device=device)
         self._flags = torch.zeros(8, dtype=torch.int32, device=device)
-        self._token = 0
+        self._token_ctr = torch.zeros(1, dtype=torch.int32, device=device)
 
         self._data_ptrs = self._exchange_ptrs(self._data)
         self._partial_ptrs = self._exchange_ptrs(self._partial)
@@ -187,7 +191,6 @@ class HierarchicalAllReduce:
     def all_reduce(self, inp: torch.Tensor, out: torch.Tensor | None = None):
         if out is None:
             out = torch.empty_like(inp)
-        self._token += 1
         numel = inp.numel()
         _hier_all_reduce_kernel[(1,)](
             inp.view(-1),
@@ -200,7 +203,7 @@ class HierarchicalAllReduce:
             island_size=self.island_size,
             counterpart=self.counterpart,
             numel=numel,
-            token=self._token,
+            token_ptr=self._token_ctr,
             BLOCK=min(8192, triton.next_power_of_2(numel)),
             num_warps=16,
         )
