@@ -47,15 +47,24 @@ def _hier_all_reduce_kernel(
     counterpart: tl.constexpr,  # same-index rank in the other island
     numel,
     token_ptr,  # device-side int32 sequence counter (cudagraph-safe)
+    MAX_ELEMS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     # Derive the sequence token on-device so graph replays stay ordered:
     # every rank launches this kernel once per collective call, so local
     # fetch-and-increment counters advance in lockstep across ranks.
     token = tl.atomic_add(token_ptr, 1, sem="relaxed") + 1
-    my_slot = tl.cast(tl.load(ptrs_ptr + rank), tl.pointer_type(tl.bfloat16))
-    my_partial = tl.cast(
-        tl.load(partial_ptrs_ptr + rank), tl.pointer_type(tl.float32)
+    # Double-buffer data/partial slots by token parity: a rank can lap a
+    # slow peer by one call, but program order plus the flag waits make a
+    # two-call lap (same-parity reuse) impossible before the peer's read.
+    buf_off = (token % 2) * MAX_ELEMS
+    my_slot = (
+        tl.cast(tl.load(ptrs_ptr + rank), tl.pointer_type(tl.bfloat16))
+        + buf_off
+    )
+    my_partial = (
+        tl.cast(tl.load(partial_ptrs_ptr + rank), tl.pointer_type(tl.float32))
+        + buf_off
     )
     my_flags = tl.cast(
         tl.load(flag_ptrs_ptr + rank), tl.pointer_type(tl.int32)
@@ -88,8 +97,12 @@ def _hier_all_reduce_kernel(
         for i in tl.static_range(island_size):
             peer = island_base + i
             if peer != rank:
-                peer_slot = tl.cast(
-                    tl.load(ptrs_ptr + peer), tl.pointer_type(tl.bfloat16)
+                peer_slot = (
+                    tl.cast(
+                        tl.load(ptrs_ptr + peer),
+                        tl.pointer_type(tl.bfloat16),
+                    )
+                    + buf_off
                 )
                 acc += tl.load(peer_slot + offs, mask=mask, other=0.0).to(
                     tl.float32
@@ -104,8 +117,12 @@ def _hier_all_reduce_kernel(
     )
     while tl.atomic_add(cp_flags + 1, 0, sem="acquire") < token:
         pass
-    cp_partial = tl.cast(
-        tl.load(partial_ptrs_ptr + counterpart), tl.pointer_type(tl.float32)
+    cp_partial = (
+        tl.cast(
+            tl.load(partial_ptrs_ptr + counterpart),
+            tl.pointer_type(tl.float32),
+        )
+        + buf_off
     )
     for off in range(0, numel, BLOCK):
         offs = off + tl.arange(0, BLOCK)
@@ -148,8 +165,8 @@ class HierarchicalAllReduce:
         self.counterpart = other[island.index(me)]
 
         # data slot (bf16), partial slot (fp32), flags (2 x int32)
-        self._data = torch.zeros(_MAX_ELEMS, dtype=torch.bfloat16, device=device)
-        self._partial = torch.zeros(_MAX_ELEMS, dtype=torch.float32, device=device)
+        self._data = torch.zeros(2 * _MAX_ELEMS, dtype=torch.bfloat16, device=device)
+        self._partial = torch.zeros(2 * _MAX_ELEMS, dtype=torch.float32, device=device)
         self._flags = torch.zeros(8, dtype=torch.int32, device=device)
         self._token_ctr = torch.zeros(1, dtype=torch.int32, device=device)
 
@@ -204,6 +221,7 @@ class HierarchicalAllReduce:
             counterpart=self.counterpart,
             numel=numel,
             token_ptr=self._token_ctr,
+            MAX_ELEMS=_MAX_ELEMS,
             BLOCK=min(8192, triton.next_power_of_2(numel)),
             num_warps=16,
         )
