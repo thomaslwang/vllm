@@ -144,19 +144,12 @@ def _hier_all_reduce_kernel(
     # the flag waits make a two-call lap (same-parity reuse) impossible
     # before the peer's read.
     buf_off = (token % 2) * MAX_ELEMS
-    my_slot = (
-        tl.cast(tl.load(ptrs_ptr + rank), tl.pointer_type(tl.bfloat16))
-        + buf_off
-    )
+    my_slot = tl.cast(tl.load(ptrs_ptr + rank), tl.pointer_type(tl.bfloat16)) + buf_off
     my_partial = (
-        tl.cast(
-            tl.load(partial_ptrs_ptr + rank), tl.pointer_type(tl.bfloat16)
-        )
+        tl.cast(tl.load(partial_ptrs_ptr + rank), tl.pointer_type(tl.bfloat16))
         + buf_off
     )
-    my_flags = tl.cast(
-        tl.load(flag_ptrs_ptr + rank), tl.pointer_type(tl.int32)
-    )
+    my_flags = tl.cast(tl.load(flag_ptrs_ptr + rank), tl.pointer_type(tl.int32))
 
     # Phase A: publish this chunk locally, then signal island peers.
     for off in range(start, end, BLOCK):
@@ -208,15 +201,11 @@ def _hier_all_reduce_kernel(
                     )
                     + buf_off
                 )
-                acc += tl.load(peer_slot + offs, mask=mask, other=0.0).to(
-                    tl.float32
-                )
+                acc += tl.load(peer_slot + offs, mask=mask, other=0.0).to(tl.float32)
         tl.store(my_partial + offs, acc.to(tl.bfloat16), mask=mask)
     tl.debug_barrier()
     _fence_sys(0)
-    cp_flags = tl.cast(
-        tl.load(flag_ptrs_ptr + counterpart), tl.pointer_type(tl.int32)
-    )
+    cp_flags = tl.cast(tl.load(flag_ptrs_ptr + counterpart), tl.pointer_type(tl.int32))
     tl.store(cp_flags + fbase + 1 * WORLD + rank, token)
 
     # Phase C: wait for the counterpart's phase-B signal for this chunk,
@@ -285,25 +274,17 @@ def _hier_two_shot_kernel(
     shard = tl.cdiv(numel, island_size)
     ss = tl.cdiv(shard, ncta)
     my_start = island_idx * shard + pid * ss
-    my_end = tl.minimum(
-        tl.minimum(island_idx * shard + shard, my_start + ss), numel
-    )
+    my_end = tl.minimum(tl.minimum(island_idx * shard + shard, my_start + ss), numel)
 
-    my_data = (
-        tl.cast(tl.load(ptrs_ptr + rank), tl.pointer_type(tl.bfloat16))
-        + buf_off
-    )
+    my_data = tl.cast(tl.load(ptrs_ptr + rank), tl.pointer_type(tl.bfloat16)) + buf_off
     my_partial = (
         tl.cast(tl.load(partial_ptrs_ptr + rank), tl.pointer_type(tl.bfloat16))
         + buf_off
     )
     my_gather = (
-        tl.cast(tl.load(gather_ptrs_ptr + rank), tl.pointer_type(tl.bfloat16))
-        + buf_off
+        tl.cast(tl.load(gather_ptrs_ptr + rank), tl.pointer_type(tl.bfloat16)) + buf_off
     )
-    my_flags = tl.cast(
-        tl.load(flag_ptrs_ptr + rank), tl.pointer_type(tl.int32)
-    )
+    my_flags = tl.cast(tl.load(flag_ptrs_ptr + rank), tl.pointer_type(tl.int32))
 
     # Phase A: publish this CTA's stripe of every shard -- exactly the bytes
     # each island peer reads for the shard it owns.
@@ -320,9 +301,7 @@ def _hier_two_shot_kernel(
     for i in tl.static_range(island_size):
         peer = island_base + i
         if peer != rank:
-            pf = tl.cast(
-                tl.load(flag_ptrs_ptr + peer), tl.pointer_type(tl.int32)
-            )
+            pf = tl.cast(tl.load(flag_ptrs_ptr + peer), tl.pointer_type(tl.int32))
             tl.store(pf + (0 * WORLD + rank) * MAX_CTA + pid, token)
 
     for i in tl.static_range(island_size):
@@ -350,18 +329,14 @@ def _hier_two_shot_kernel(
             peer = island_base + i
             if peer != rank:
                 pd = (
-                    tl.cast(
-                        tl.load(ptrs_ptr + peer), tl.pointer_type(tl.bfloat16)
-                    )
+                    tl.cast(tl.load(ptrs_ptr + peer), tl.pointer_type(tl.bfloat16))
                     + buf_off
                 )
                 acc += tl.load(pd + offs, mask=mask, other=0.0).to(tl.float32)
         tl.store(my_partial + offs, acc.to(tl.bfloat16), mask=mask)
     tl.debug_barrier()
     _fence_sys(0)
-    cpf = tl.cast(
-        tl.load(flag_ptrs_ptr + counterpart), tl.pointer_type(tl.int32)
-    )
+    cpf = tl.cast(tl.load(flag_ptrs_ptr + counterpart), tl.pointer_type(tl.int32))
     tl.store(cpf + (1 * WORLD + rank) * MAX_CTA + pid, token)
 
     # Phase C: single cross-island exchange, shard-sized. The counterpart
@@ -396,9 +371,7 @@ def _hier_two_shot_kernel(
     for i in tl.static_range(island_size):
         peer = island_base + i
         if peer != rank:
-            pf = tl.cast(
-                tl.load(flag_ptrs_ptr + peer), tl.pointer_type(tl.int32)
-            )
+            pf = tl.cast(tl.load(flag_ptrs_ptr + peer), tl.pointer_type(tl.int32))
             tl.store(pf + (2 * WORLD + rank) * MAX_CTA + pid, token)
 
     # Phase D: allgather the finished shards from the island.
@@ -420,9 +393,7 @@ def _hier_two_shot_kernel(
     for s in tl.static_range(island_size):
         peer = island_base + s
         pg = (
-            tl.cast(
-                tl.load(gather_ptrs_ptr + peer), tl.pointer_type(tl.bfloat16)
-            )
+            tl.cast(tl.load(gather_ptrs_ptr + peer), tl.pointer_type(tl.bfloat16))
             + buf_off
         )
         start = s * shard + pid * ss
@@ -480,12 +451,8 @@ class HierarchicalAllReduce:
         gather_ptr = self._alloc(rt, 2 * _MAX_ELEMS * 2)
         flags_ptr = self._alloc(rt, _MAX_CTA * 2 * self.world_size * 4)
         flags2_ptr = self._alloc(rt, 3 * self.world_size * _MAX_CTA * 4)
-        self._token_ctr = torch.zeros(
-            _MAX_CTA, dtype=torch.int32, device=device
-        )
-        self._token_ctr2 = torch.zeros(
-            _MAX_CTA, dtype=torch.int32, device=device
-        )
+        self._token_ctr = torch.zeros(_MAX_CTA, dtype=torch.int32, device=device)
+        self._token_ctr2 = torch.zeros(_MAX_CTA, dtype=torch.int32, device=device)
 
         self._data_ptrs = self._exchange_ptrs(rt, data_ptr)
         self._partial_ptrs = self._exchange_ptrs(rt, partial_ptr)
@@ -507,18 +474,12 @@ class HierarchicalAllReduce:
         kernels' direct loads/stores."""
         handle = _IpcHandle()
         _check(
-            rt.cudaIpcGetMemHandle(
-                ctypes.byref(handle), ctypes.c_void_p(local_ptr)
-            ),
+            rt.cudaIpcGetMemHandle(ctypes.byref(handle), ctypes.c_void_p(local_ptr)),
             "cudaIpcGetMemHandle",
         )
         objs: list = [None] * self.world_size
-        dist.all_gather_object(
-            objs, (self.rank, bytes(handle)), group=self.group
-        )
-        ptrs = torch.zeros(
-            self.world_size, dtype=torch.int64, device=self.device
-        )
+        dist.all_gather_object(objs, (self.rank, bytes(handle)), group=self.group)
+        ptrs = torch.zeros(self.world_size, dtype=torch.int64, device=self.device)
         for rank, hbytes in objs:
             if rank == self.rank:
                 ptrs[rank] = local_ptr
@@ -526,9 +487,7 @@ class HierarchicalAllReduce:
             h = _IpcHandle.from_buffer_copy(hbytes)
             peer_ptr = ctypes.c_void_p()
             _check(
-                rt.cudaIpcOpenMemHandle(
-                    ctypes.byref(peer_ptr), h, ctypes.c_uint(1)
-                ),
+                rt.cudaIpcOpenMemHandle(ctypes.byref(peer_ptr), h, ctypes.c_uint(1)),
                 "cudaIpcOpenMemHandle",
             )
             self._opened.append(peer_ptr.value)
@@ -558,9 +517,7 @@ class HierarchicalAllReduce:
             out = torch.empty_like(inp)
         numel = inp.numel()
         if numel >= _TWO_SHOT_MIN_ELEMS:
-            ncta = min(
-                _MAX_CTA, max(1, numel // (self.island_size * 1024))
-            )
+            ncta = min(_MAX_CTA, max(1, numel // (self.island_size * 1024)))
             _hier_two_shot_kernel[(ncta,)](
                 inp.view(-1),
                 out.view(-1),
