@@ -34,8 +34,13 @@ from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
-_MAX_ELEMS = 64 * 1024  # 128KB bf16 cap; decode messages are ~8-48KB
+_MAX_ELEMS = 256 * 1024  # 512KB bf16 cap; decode messages are ~8-512KB
 _MAX_CTA = 16
+# One-shot moves 4n remote bytes in 2 sync rounds, two-shot 7n/4 in 3 and
+# crosses the slow inter-island link with only n/island_size. Latency wins
+# below this size, bandwidth above it; crossover measured on 2x4 A800 PCIe
+# (32KB: 45.6 vs 47.3us one-shot favoured, 48KB: 54.3 vs 49.6 two-shot).
+_TWO_SHOT_MIN_ELEMS = 24 * 1024
 
 
 class _IpcHandle(ctypes.Structure):
@@ -243,6 +248,195 @@ def _hier_all_reduce_kernel(
         tl.store(out_ptr + offs, acc.to(tl.bfloat16), mask=mask)
 
 
+@triton.jit
+def _hier_two_shot_kernel(
+    inp_ptr,
+    out_ptr,
+    ptrs_ptr,  # [world] int64 pointers to each rank's data slot
+    partial_ptrs_ptr,  # [world] pointers to each rank's island-partial slot
+    gather_ptrs_ptr,  # [world] pointers to each rank's global-shard slot
+    flag_ptrs_ptr,  # [world] pointers to each rank's flag array
+    rank: tl.constexpr,
+    island_base: tl.constexpr,
+    island_idx: tl.constexpr,  # this rank's index inside its island
+    island_size: tl.constexpr,
+    counterpart: tl.constexpr,
+    WORLD: tl.constexpr,
+    numel,
+    token_ptr,  # [MAX_CTA] device int32 sequence counters
+    MAX_ELEMS: tl.constexpr,
+    MAX_CTA: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Two-shot variant: reduce-scatter, one cross-island shard exchange,
+    then allgather. Moves 7n/4 remote bytes against the one-shot kernel's
+    4n, and only n/island_size of that crosses the slow inter-island link
+    (vs n) -- the win grows with message size.
+
+    Partitioning is a stripe: CTA k owns slice k of *every* shard, so a
+    reader CTA always waits on the same CTA index of its peers and no
+    cross-CTA barrier is needed.
+    """
+    pid = tl.program_id(0)
+    ncta = tl.num_programs(0)
+    token = tl.atomic_add(token_ptr + pid, 1, sem="relaxed") + 1
+    buf_off = (token % 2) * MAX_ELEMS
+
+    shard = tl.cdiv(numel, island_size)
+    ss = tl.cdiv(shard, ncta)
+    my_start = island_idx * shard + pid * ss
+    my_end = tl.minimum(
+        tl.minimum(island_idx * shard + shard, my_start + ss), numel
+    )
+
+    my_data = (
+        tl.cast(tl.load(ptrs_ptr + rank), tl.pointer_type(tl.bfloat16))
+        + buf_off
+    )
+    my_partial = (
+        tl.cast(tl.load(partial_ptrs_ptr + rank), tl.pointer_type(tl.bfloat16))
+        + buf_off
+    )
+    my_gather = (
+        tl.cast(tl.load(gather_ptrs_ptr + rank), tl.pointer_type(tl.bfloat16))
+        + buf_off
+    )
+    my_flags = tl.cast(
+        tl.load(flag_ptrs_ptr + rank), tl.pointer_type(tl.int32)
+    )
+
+    # Phase A: publish this CTA's stripe of every shard -- exactly the bytes
+    # each island peer reads for the shard it owns.
+    for s in tl.static_range(island_size):
+        start = s * shard + pid * ss
+        end = tl.minimum(tl.minimum(s * shard + shard, start + ss), numel)
+        for off in range(start, end, BLOCK):
+            offs = off + tl.arange(0, BLOCK)
+            mask = offs < end
+            x = tl.load(inp_ptr + offs, mask=mask, other=0.0)
+            tl.store(my_data + offs, x, mask=mask)
+    tl.debug_barrier()
+    _fence_sys(0)
+    for i in tl.static_range(island_size):
+        peer = island_base + i
+        if peer != rank:
+            pf = tl.cast(
+                tl.load(flag_ptrs_ptr + peer), tl.pointer_type(tl.int32)
+            )
+            tl.store(pf + (0 * WORLD + rank) * MAX_CTA + pid, token)
+
+    for i in tl.static_range(island_size):
+        peer = island_base + i
+        if peer != rank:
+            while (
+                tl.atomic_add(
+                    my_flags + (0 * WORLD + peer) * MAX_CTA + pid,
+                    0,
+                    sem="acquire",
+                    scope="sys",
+                )
+                < token
+            ):
+                pass
+    _fence_sys(0)
+    tl.debug_barrier()
+
+    # Phase B: reduce-scatter -- sum the island over the shard this rank owns.
+    for off in range(my_start, my_end, BLOCK):
+        offs = off + tl.arange(0, BLOCK)
+        mask = offs < my_end
+        acc = tl.load(my_data + offs, mask=mask, other=0.0).to(tl.float32)
+        for i in tl.static_range(island_size):
+            peer = island_base + i
+            if peer != rank:
+                pd = (
+                    tl.cast(
+                        tl.load(ptrs_ptr + peer), tl.pointer_type(tl.bfloat16)
+                    )
+                    + buf_off
+                )
+                acc += tl.load(pd + offs, mask=mask, other=0.0).to(tl.float32)
+        tl.store(my_partial + offs, acc.to(tl.bfloat16), mask=mask)
+    tl.debug_barrier()
+    _fence_sys(0)
+    cpf = tl.cast(
+        tl.load(flag_ptrs_ptr + counterpart), tl.pointer_type(tl.int32)
+    )
+    tl.store(cpf + (1 * WORLD + rank) * MAX_CTA + pid, token)
+
+    # Phase C: single cross-island exchange, shard-sized. The counterpart
+    # holds the same island-local index, hence the same shard offsets.
+    while (
+        tl.atomic_add(
+            my_flags + (1 * WORLD + counterpart) * MAX_CTA + pid,
+            0,
+            sem="acquire",
+            scope="sys",
+        )
+        < token
+    ):
+        pass
+    _fence_sys(0)
+    tl.debug_barrier()
+    cp_partial = (
+        tl.cast(
+            tl.load(partial_ptrs_ptr + counterpart),
+            tl.pointer_type(tl.bfloat16),
+        )
+        + buf_off
+    )
+    for off in range(my_start, my_end, BLOCK):
+        offs = off + tl.arange(0, BLOCK)
+        mask = offs < my_end
+        acc = tl.load(my_partial + offs, mask=mask, other=0.0).to(tl.float32)
+        acc += tl.load(cp_partial + offs, mask=mask, other=0.0).to(tl.float32)
+        tl.store(my_gather + offs, acc.to(tl.bfloat16), mask=mask)
+    tl.debug_barrier()
+    _fence_sys(0)
+    for i in tl.static_range(island_size):
+        peer = island_base + i
+        if peer != rank:
+            pf = tl.cast(
+                tl.load(flag_ptrs_ptr + peer), tl.pointer_type(tl.int32)
+            )
+            tl.store(pf + (2 * WORLD + rank) * MAX_CTA + pid, token)
+
+    # Phase D: allgather the finished shards from the island.
+    for i in tl.static_range(island_size):
+        peer = island_base + i
+        if peer != rank:
+            while (
+                tl.atomic_add(
+                    my_flags + (2 * WORLD + peer) * MAX_CTA + pid,
+                    0,
+                    sem="acquire",
+                    scope="sys",
+                )
+                < token
+            ):
+                pass
+    _fence_sys(0)
+    tl.debug_barrier()
+    for s in tl.static_range(island_size):
+        peer = island_base + s
+        pg = (
+            tl.cast(
+                tl.load(gather_ptrs_ptr + peer), tl.pointer_type(tl.bfloat16)
+            )
+            + buf_off
+        )
+        start = s * shard + pid * ss
+        end = tl.minimum(tl.minimum(s * shard + shard, start + ss), numel)
+        for off in range(start, end, BLOCK):
+            offs = off + tl.arange(0, BLOCK)
+            mask = offs < end
+            tl.store(
+                out_ptr + offs,
+                tl.load(pg + offs, mask=mask, other=0.0),
+                mask=mask,
+            )
+
+
 class HierarchicalAllReduce:
     """Two-level island-aware allreduce over IPC-shared buffers.
 
@@ -283,14 +477,21 @@ class HierarchicalAllReduce:
         # [phase(2) x writer(world)] int32
         data_ptr = self._alloc(rt, 2 * _MAX_ELEMS * 2)
         partial_ptr = self._alloc(rt, 2 * _MAX_ELEMS * 2)
+        gather_ptr = self._alloc(rt, 2 * _MAX_ELEMS * 2)
         flags_ptr = self._alloc(rt, _MAX_CTA * 2 * self.world_size * 4)
+        flags2_ptr = self._alloc(rt, 3 * self.world_size * _MAX_CTA * 4)
         self._token_ctr = torch.zeros(
+            _MAX_CTA, dtype=torch.int32, device=device
+        )
+        self._token_ctr2 = torch.zeros(
             _MAX_CTA, dtype=torch.int32, device=device
         )
 
         self._data_ptrs = self._exchange_ptrs(rt, data_ptr)
         self._partial_ptrs = self._exchange_ptrs(rt, partial_ptr)
+        self._gather_ptrs = self._exchange_ptrs(rt, gather_ptr)
         self._flag_ptrs = self._exchange_ptrs(rt, flags_ptr)
+        self._flag2_ptrs = self._exchange_ptrs(rt, flags2_ptr)
 
     def _alloc(self, rt, nbytes: int) -> int:
         ptr = ctypes.c_void_p()
@@ -345,19 +546,42 @@ class HierarchicalAllReduce:
             pass
 
     def should_use(self, inp: torch.Tensor) -> bool:
-        # Above ~48KB NCCL switches to a bandwidth-efficient protocol that
-        # beats the one-shot read design; below it, local measurements on
-        # 2x4 A800 PCIe show 1.15-1.3x wins.
         return (
             inp.dtype == torch.bfloat16
             and inp.is_contiguous()
-            and inp.numel() <= 24 * 1024
+            and inp.numel() <= _MAX_ELEMS
+            and inp.numel() % self.island_size == 0
         )
 
     def all_reduce(self, inp: torch.Tensor, out: torch.Tensor | None = None):
         if out is None:
             out = torch.empty_like(inp)
         numel = inp.numel()
+        if numel >= _TWO_SHOT_MIN_ELEMS:
+            ncta = min(
+                _MAX_CTA, max(1, numel // (self.island_size * 1024))
+            )
+            _hier_two_shot_kernel[(ncta,)](
+                inp.view(-1),
+                out.view(-1),
+                self._data_ptrs,
+                self._partial_ptrs,
+                self._gather_ptrs,
+                self._flag2_ptrs,
+                rank=self.rank,
+                island_base=self.island_base,
+                island_idx=self.rank - self.island_base,
+                island_size=self.island_size,
+                counterpart=self.counterpart,
+                WORLD=self.world_size,
+                numel=numel,
+                token_ptr=self._token_ctr2,
+                MAX_ELEMS=_MAX_ELEMS,
+                MAX_CTA=_MAX_CTA,
+                BLOCK=min(4096, triton.next_power_of_2(numel)),
+                num_warps=8,
+            )
+            return out
         ncta = min(_MAX_CTA, max(1, (numel + 4095) // 4096))
         _hier_all_reduce_kernel[(ncta,)](
             inp.view(-1),
