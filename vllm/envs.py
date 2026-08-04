@@ -315,6 +315,7 @@ if TYPE_CHECKING:
     VLLM_ELASTIC_EP_SCALE_UP_LAUNCH: bool = False
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
+    VLLM_HIER_ALL_REDUCE: str = ""
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_FORCE_N_CONTIG_WEIGHT: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
@@ -2115,6 +2116,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": lambda: bool(
         int(os.getenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1"))
     ),
+    # Island partition for the hierarchical allreduce, e.g. "0,1,2,3;4,5,6,7"
+    # for a 2x4 PCIe box. Empty disables it.
+    "VLLM_HIER_ALL_REDUCE": lambda: os.getenv("VLLM_HIER_ALL_REDUCE", ""),
     # Whether enable XPU graph on Intel GPU
     "VLLM_XPU_ENABLE_XPU_GRAPH": lambda: bool(
         int(os.getenv("VLLM_XPU_ENABLE_XPU_GRAPH", "0"))

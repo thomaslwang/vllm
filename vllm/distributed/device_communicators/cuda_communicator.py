@@ -88,6 +88,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         from vllm.distributed.device_communicators.flashinfer_pcie_ipc_all_reduce import (  # noqa: E501
             FlashInferPcieIpcAllReduce,
         )
+        from vllm.distributed.device_communicators.hier_all_reduce import (
+            HierarchicalAllReduce,
+        )
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.device_communicators.quick_all_reduce import (
             QuickAllReduce,
@@ -165,6 +168,24 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 self.aiter_ar_comm = None
             else:
                 self.use_aiter_ag_rs = True
+
+        self.hier_ar_comm: HierarchicalAllReduce | None = None
+        if envs.VLLM_HIER_ALL_REDUCE and self.world_size > 1:
+            islands = [
+                [int(r) for r in part.split(",")]
+                for part in envs.VLLM_HIER_ALL_REDUCE.split(";")
+            ]
+            if sorted(r for i in islands for r in i) == list(range(self.world_size)):
+                self.hier_ar_comm = HierarchicalAllReduce(
+                    self.cpu_group, self.device, islands
+                )
+            else:
+                logger.warning(
+                    "VLLM_HIER_ALL_REDUCE=%s does not cover ranks 0..%d exactly; "
+                    "hierarchical allreduce disabled.",
+                    envs.VLLM_HIER_ALL_REDUCE,
+                    self.world_size - 1,
+                )
 
         if use_custom_allreduce and self.world_size > 1 and current_platform.is_rocm():
             # Initialize a custom quick all-reduce implementation for AMD.
@@ -369,6 +390,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = aiter_ar_comm.custom_all_reduce(input_)
             assert out is not None
             return out
+        hier_ar_comm = self.hier_ar_comm
+        if hier_ar_comm is not None and hier_ar_comm.should_use(input_):
+            return hier_ar_comm.all_reduce(input_)
         ca_comm = self.ca_comm
         if (
             ca_comm is not None
