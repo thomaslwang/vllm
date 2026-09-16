@@ -37,6 +37,7 @@ from vllm.utils.import_utils import has_cutedsl_fp8
 from vllm.utils.math_utils import next_power_of_2
 from vllm.v1.attention.ops.fp8_e4m3_portable import (
     e4m3_bytes_to_float,
+    float_to_e4m3_bytes,
     has_native_fp8e4nv,
 )
 
@@ -73,6 +74,7 @@ def quantize_and_insert_k_kernel(
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 8 (7 real + 1 padding)
     use_fnuz: tl.constexpr = False,
+    NATIVE_FP8: tl.constexpr = True,
 ):
     """
     Quantize K tensor and insert into paged K cache.
@@ -151,10 +153,9 @@ def quantize_and_insert_k_kernel(
 
             # Convert to fp8 (FNUZ on gfx942, OCP elsewhere), then bitcast to uint8.
             if use_fnuz:
-                x_fp8 = x_clamped.to(tl.float8e4b8)
+                x_uint8 = x_clamped.to(tl.float8e4b8).to(tl.uint8, bitcast=True)
             else:
-                x_fp8 = x_clamped.to(tl.float8e4nv)
-            x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+                x_uint8 = float_to_e4m3_bytes(x_clamped, NATIVE_FP8)
 
             # Store as uint8 (1 byte each)
             tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
@@ -192,6 +193,7 @@ def _quantize_and_insert_k_mxfp8_kernel(
     block_stride: tl.constexpr,  # total bytes per block (padded)
     fp8_max: tl.constexpr,
     use_fnuz: tl.constexpr = False,
+    NATIVE_FP8: tl.constexpr = True,
 ):
     """Quantize a bf16 K row to MXFP8 and insert it into a V4.1 paged cache.
 
@@ -228,12 +230,10 @@ def _quantize_and_insert_k_mxfp8_kernel(
         tiles * tl.reshape(tl.exp2(-exponent), (scale_dim, 1)), -fp8_max, fp8_max
     )
     if use_fnuz:  # noqa: SIM108
-        fp8 = scaled.to(tl.float8e4b8)
+        packed = scaled.to(tl.float8e4b8).to(tl.uint8, bitcast=True)
     else:
-        fp8 = scaled.to(tl.float8e4nv)
-    tl.store(
-        token_data_ptr + d, tl.reshape(fp8.to(tl.uint8, bitcast=True), (head_dim,))
-    )
+        packed = float_to_e4m3_bytes(scaled, NATIVE_FP8)
+    tl.store(token_data_ptr + d, tl.reshape(packed, (head_dim,)))
 
     # UE8M0 encoding: stored_value = exponent + 127 (bias).
     encoded = tl.minimum(tl.maximum(exponent + 127.0, 0.0), 255.0)
@@ -287,6 +287,7 @@ def quantize_and_insert_k_cache(
             if use_fnuz
             else torch.finfo(torch.float8_e4m3fn).max,
             use_fnuz=use_fnuz,
+            NATIVE_FP8=has_native_fp8e4nv(),
         )
         return
 
@@ -320,6 +321,7 @@ def quantize_and_insert_k_cache(
         fp8_max=FP8_MAX,
         n_quant_blocks=8,
         use_fnuz=use_fnuz,
+        NATIVE_FP8=has_native_fp8e4nv(),
     )
 
 
