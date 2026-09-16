@@ -6,6 +6,10 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.fp8_e4m3_portable import (
+    float_to_e4m3_bytes,
+    has_native_fp8e4nv,
+)
 
 if current_platform.is_rocm():
     from vllm.platforms.rocm import _ON_GFX950
@@ -268,6 +272,7 @@ def rope_quant_insert(
             CACHE_BLOCK=kv_cache.shape[1],
             COMPRESS_RATIO=compress_ratio,
             SANITIZE_CACHE_NANS=_ON_GFX950,
+            NATIVE_FP8=has_native_fp8e4nv(),
             num_warps=4,
             **launch_kwargs,
         )
@@ -309,6 +314,7 @@ def _rope_quant_insert_kernel(
     CACHE_BLOCK: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     SANITIZE_CACHE_NANS: tl.constexpr,
+    NATIVE_FP8: tl.constexpr,
 ):
     t = tl.program_id(0)
     slot = tl.load(cache_slots + t)
@@ -327,8 +333,9 @@ def _rope_quant_insert_kernel(
     amax = tl.maximum(tl.max(tl.abs(quant), 1), 1e-4)
     exponent = tl.ceil(tl.log2(amax * (1.0 / 448.0)))
     scaled = quant * tl.reshape(tl.exp2(-exponent), (8, 1))
-    fp8 = tl.clamp(scaled, -448.0, 448.0).to(tl.float8e4nv)
-    packed = tl.reshape(fp8.to(tl.uint8, bitcast=True), (512,))
+    packed = tl.reshape(
+        float_to_e4m3_bytes(tl.clamp(scaled, -448.0, 448.0), NATIVE_FP8), (512,)
+    )
     tl.store(values + d, packed, d < 448)
     s = tl.arange(0, 8)
     max_encoded: tl.constexpr = 254.0 if SANITIZE_CACHE_NANS else 255.0
@@ -360,6 +367,7 @@ def _rope_quant_insert_mxfp8_kernel(
     CACHE_BLOCK: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     SANITIZE_CACHE_NANS: tl.constexpr,
+    NATIVE_FP8: tl.constexpr,
 ):
     """V4.1 record: RoPE first, then MXFP8-quantize all 512 dims.
 
@@ -394,8 +402,12 @@ def _rope_quant_insert_mxfp8_kernel(
     amax = tl.maximum(tl.max(tl.abs(quant), 1), 1e-4)
     exponent = tl.ceil(tl.log2(amax * (1.0 / 448.0)))
     scaled = quant * tl.reshape(tl.exp2(-exponent), (16, 1))
-    fp8 = tl.clamp(scaled, -448.0, 448.0).to(tl.float8e4nv)
-    tl.store(values + d, tl.reshape(fp8.to(tl.uint8, bitcast=True), (512,)))
+    tl.store(
+        values + d,
+        tl.reshape(
+            float_to_e4m3_bytes(tl.clamp(scaled, -448.0, 448.0), NATIVE_FP8), (512,)
+        ),
+    )
 
     max_encoded: tl.constexpr = 254.0 if SANITIZE_CACHE_NANS else 255.0
     encoded = tl.minimum(tl.maximum(exponent + 127.0, 0.0), max_encoded)

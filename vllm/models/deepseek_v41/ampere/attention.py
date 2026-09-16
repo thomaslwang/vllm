@@ -5,6 +5,7 @@
 import torch
 
 from vllm.models.deepseek_v41.ampere.o_proj import ampere_bf16_o_proj
+from vllm.models.deepseek_v41.ampere.sparse_attn import ampere_sparse_attn
 from vllm.models.deepseek_v41.nvidia.flashmla import DeepseekV4FlashMLAAttention
 
 
@@ -33,4 +34,22 @@ class DeepseekV4AmpereAttention(DeepseekV4FlashMLAAttention):
             nope_dim=self.nope_head_dim,
             rope_dim=self.rope_head_dim,
             o_lora_rank=self.o_lora_rank,
+        )
+
+    def _sparse_attn_fwd(
+        self,
+        *,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        ampere_sparse_attn(
+            q,
+            kv,
+            indices,
+            self.scale,
+            self.attn_sink,
+            out=out,
         )

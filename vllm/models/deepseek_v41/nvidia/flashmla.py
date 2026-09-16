@@ -74,6 +74,30 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             tma_aligned_scales=self._tma_aligned_scales,
         )
 
+    def _sparse_attn_fwd(
+        self,
+        *,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        """Prefill sparse attention over gathered BF16 KV.
+
+        A seam for backends without FlashMLA; `indices` is `-1`-padded and
+        `topk_length` gives each row's valid count.
+        """
+        flash_mla_sparse_fwd(
+            q=q,
+            kv=kv,
+            indices=indices,
+            sm_scale=self.scale,
+            attn_sink=self.attn_sink,
+            topk_length=topk_length,
+            out=out,
+        )
+
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         # FP8 decode kernel only supports h_q = 64 or 128.
@@ -376,12 +400,10 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 ),
                 max_image_tokens=self.max_image_tokens,
             )
-            flash_mla_sparse_fwd(
+            self._sparse_attn_fwd(
                 q=q[query_start:query_end],
                 kv=kv.view(-1, 1, q.shape[-1]),
                 indices=combined_indices.unsqueeze(1),
-                sm_scale=self.scale,
-                attn_sink=self.attn_sink,
                 topk_length=combined_lens,
                 out=output[query_start:query_end],
             )
