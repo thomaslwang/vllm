@@ -149,6 +149,12 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
 
     if device_capability is not None and device_capability.major == 12:
         return DeepseekV4FlashInferSM120Attention
+    if device_capability is not None and device_capability.major == 8:
+        from vllm.models.deepseek_v41.ampere.attention import (
+            DeepseekV4AmpereAttention,
+        )
+
+        return DeepseekV4AmpereAttention
     return DeepseekV4FlashMLAAttention
 
 

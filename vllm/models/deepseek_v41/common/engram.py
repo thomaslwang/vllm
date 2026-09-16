@@ -51,6 +51,10 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.fp8_e4m3_portable import (
+    e4m3_bytes_to_float,
+    has_native_fp8e4nv,
+)
 
 logger = init_logger(__name__)
 
@@ -602,6 +606,7 @@ def _engram_lookup_kernel(
     QUANT_BLOCK: tl.constexpr,
     BLOCK_R: tl.constexpr,
     GRID,
+    PORTABLE_FP8: tl.constexpr = False,
 ):
     """Gather fp8 rows, apply their ue8m0 block scales, write bf16.
 
@@ -623,11 +628,21 @@ def _engram_lookup_kernel(
         owned = valid & (head < TOTAL_HEADS)
         owned &= (index >= vocab_start) & (index < vocab_end)
         local = tl.where(owned, index - vocab_start, 0)
-        values = tl.load(
-            weight + local[:, None] * DIM + cols[None, :],
-            mask=owned[:, None],
-            other=0.0,
-        )
+        # PORTABLE_FP8: `weight` is a uint8 view of the same E4M3 rows, for
+        # architectures whose Triton backend rejects the fp8e4nv type.
+        if PORTABLE_FP8:
+            raw = tl.load(
+                weight + local[:, None] * DIM + cols[None, :],
+                mask=owned[:, None],
+                other=0,
+            )
+            values = e4m3_bytes_to_float(raw, False)
+        else:
+            values = tl.load(
+                weight + local[:, None] * DIM + cols[None, :],
+                mask=owned[:, None],
+                other=0.0,
+            )
         scale = tl.load(
             scales + local[:, None] * (DIM // QUANT_BLOCK) + scale_cols[None, :],
             mask=owned[:, None],
@@ -714,6 +729,9 @@ class ParallelEngramEmbedding(nn.Module):
         if not rows:
             return
         weight, scales = self._storage()
+        portable_fp8 = weight.dtype == torch.float8_e4m3fn and not has_native_fp8e4nv()
+        if portable_fp8:
+            weight = weight.view(torch.uint8)
         # The table dwarfs TLB reach, so a persistent grid near the SM count
         # beats one program per row; halve it to leave SMs for the main stream.
         tiles = triton.cdiv(rows, 16)
@@ -735,6 +753,7 @@ class ParallelEngramEmbedding(nn.Module):
             QUANT_BLOCK=self.block_size,
             BLOCK_R=16,
             GRID=grid,
+            PORTABLE_FP8=portable_fp8,
         )
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:

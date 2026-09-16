@@ -601,6 +601,23 @@ def has_cutedsl() -> bool:
     return _has_module("cutlass")
 
 
+def has_cutedsl_fp8() -> bool:
+    """Whether CuteDSL kernels that emit FP8 conversions can run here.
+
+    Those kernels lower to `cvt.e4m3x2.f32`, which ptxas rejects below sm_89,
+    so availability of the package alone is not enough to select them.
+    """
+    if not has_cutedsl():
+        return False
+
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return False
+    capability = current_platform.get_device_capability()
+    return capability is not None and (capability.major, capability.minor) >= (8, 9)
+
+
 def has_humming() -> bool:
     """Whether the optional `humming` package is available."""
     return _has_module("humming")

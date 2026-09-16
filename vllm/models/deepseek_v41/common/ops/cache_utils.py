@@ -33,8 +33,12 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.import_utils import has_cutedsl
+from vllm.utils.import_utils import has_cutedsl_fp8
 from vllm.utils.math_utils import next_power_of_2
+from vllm.v1.attention.ops.fp8_e4m3_portable import (
+    e4m3_bytes_to_float,
+    has_native_fp8e4nv,
+)
 
 # Per-token byte width of the two paged fp8 records. Both put a page's whole
 # data region ahead of its whole scale region, so ``k_cache.shape[-1]`` -- the
@@ -342,6 +346,7 @@ def _dequantize_and_gather_k_kernel(
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 7 real blocks
     use_fnuz: tl.constexpr = False,
+    portable_fp8: tl.constexpr = False,
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
@@ -400,13 +405,14 @@ def _dequantize_and_gather_k_kernel(
                 x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
 
                 # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere).
+                # portable_fp8 decodes OCP E4M3 without naming fp8e4nv, which
+                # Triton rejects outright on sm_80/sm_86.
                 if use_fnuz:
-                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+                    x_float = x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.float32)
+                elif portable_fp8:
+                    x_float = e4m3_bytes_to_float(x_uint8, False)
                 else:
-                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-
-                # Convert fp8 to float32 for computation
-                x_float = x_fp8.to(tl.float32)
+                    x_float = x_uint8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
 
                 # Load and decode UE8M0 scale
                 # UE8M0: scale = 2^(stored_value - 127)
@@ -450,6 +456,7 @@ def _dequantize_and_gather_k_mxfp8_kernel(
     cache_block_size: tl.constexpr,
     block_stride: tl.constexpr,
     use_fnuz: tl.constexpr = False,
+    portable_fp8: tl.constexpr = False,
 ):
     """Gather V4.1 MXFP8 rows into a bf16 workspace, dequantizing in place."""
     batch_idx = tl.program_id(0)
@@ -482,10 +489,12 @@ def _dequantize_and_gather_k_mxfp8_kernel(
 
         x_uint8 = tl.load(token_data_ptr + d)
         if use_fnuz:
-            x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+            x_float = x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.float32)
+        elif portable_fp8:
+            x_float = e4m3_bytes_to_float(x_uint8, False)
         else:
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-        tiles = tl.reshape(x_fp8.to(tl.float32), (scale_dim, quant_block))
+            x_float = x_uint8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        tiles = tl.reshape(x_float, (scale_dim, quant_block))
 
         # UE8M0: scale = 2^(stored_value - 127).
         encoded = tl.load(token_scale_ptr + s)
@@ -513,6 +522,7 @@ def dequantize_and_gather_k_cache_triton(
 ) -> None:
     num_reqs = seq_lens.shape[0]
     NUM_WORKERS = 128
+    portable_fp8 = not use_fnuz and not has_native_fp8e4nv()
     if k_cache.shape[-1] == V41_BYTES_PER_TOKEN:
         _dequantize_and_gather_k_mxfp8_kernel[(num_reqs, NUM_WORKERS)](
             out,
@@ -530,6 +540,7 @@ def dequantize_and_gather_k_cache_triton(
             cache_block_size=block_size,
             block_stride=k_cache.stride(0),
             use_fnuz=use_fnuz,
+            portable_fp8=portable_fp8,
         )
         return
 
@@ -561,6 +572,7 @@ def dequantize_and_gather_k_cache_triton(
         fp8_max=FP8_MAX,
         n_quant_blocks=7,
         use_fnuz=use_fnuz,
+        portable_fp8=portable_fp8,
     )
 
 
@@ -588,7 +600,7 @@ def dequantize_and_gather_k_cache(
     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
     writes FNUZ on gfx942 and OCP on gfx950).
     """
-    if has_cutedsl():
+    if has_cutedsl_fp8():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
             _DEQUANT_GATHER_K_CACHE_CUTEDSL_KERNEL,
