@@ -569,6 +569,24 @@ def fp8_fp4_mqa_logits(
     Returns:
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
+    if not is_deep_gemm_supported():
+        # Ampere: DeepGEMM's attention kernels assert on the architecture.
+        # The FP8 layout here is exactly what the Triton fallback takes.
+        q_values, q_scale = q
+        if q_scale is not None:
+            raise NotImplementedError(
+                "MXFP4 indexer Q has no pre-SM90 fallback; it is SM100-only."
+            )
+        from vllm.v1.attention.ops.mqa_logits_triton import fp8_mqa_logits_triton
+
+        return fp8_mqa_logits_triton(
+            q_values,
+            kv,
+            weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            clean_logits=clean_logits,
+        )
     _lazy_init()
     if _fp8_fp4_mqa_logits_impl is None:
         return _missing()
@@ -675,6 +693,25 @@ def fp8_fp4_paged_mqa_logits(
         Logits tensor of shape [B * next_n, max_model_len], dtype
         `torch.float32`.
     """
+    if not is_deep_gemm_supported():
+        q_values, q_scale = q
+        if q_scale is not None:
+            raise NotImplementedError(
+                "MXFP4 indexer Q has no pre-SM90 fallback; it is SM100-only."
+            )
+        from vllm.v1.attention.ops.mqa_logits_triton import (
+            fp8_paged_mqa_logits_triton,
+        )
+
+        return fp8_paged_mqa_logits_triton(
+            q_values,
+            kv_cache,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+            clean_logits=clean_logits,
+        )
     _lazy_init()
     if _fp8_fp4_paged_mqa_logits_impl is None:
         return _missing()
