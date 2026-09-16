@@ -21,6 +21,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.v1.attention.ops.fp8_e4m3_portable import has_native_fp8e4nv
 
 
 class FusedInvRopeFP8QuantKernel(
@@ -265,7 +266,10 @@ class FusedInvRopeFP8QuantKernel(
             quant_group_size=128,
             tma_aligned_scales=capability.major >= 10,
             launch_pdl=current_platform.is_arch_support_pdl(),
-            quantize=True,
+            # Architectures without a native fp8e4nv type run the BF16 o_proj,
+            # which calls this kernel with quantize=False; warming the FP8
+            # variant there would compile a cast Triton cannot lower.
+            quantize=has_native_fp8e4nv(),
         )
 
     def warmup_inputs(self, compile_key: CompileKey) -> dict[str, Any]:

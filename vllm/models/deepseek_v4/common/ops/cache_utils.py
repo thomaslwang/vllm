@@ -38,6 +38,11 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl_fp8
 from vllm.utils.math_utils import next_power_of_2
+from vllm.v1.attention.ops.fp8_e4m3_portable import (
+    e4m3_bytes_to_float,
+    float_to_e4m3_bytes,
+    has_native_fp8e4nv,
+)
 
 
 @triton.jit
@@ -60,6 +65,7 @@ def quantize_and_insert_k_kernel(
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 8 (7 real + 1 padding)
     use_fnuz: tl.constexpr = False,
+    NATIVE_FP8: tl.constexpr = True,
 ):
     """
     Quantize K tensor and insert into paged K cache.
@@ -138,10 +144,9 @@ def quantize_and_insert_k_kernel(
 
             # Convert to fp8 (FNUZ on gfx942, OCP elsewhere), then bitcast to uint8.
             if use_fnuz:
-                x_fp8 = x_clamped.to(tl.float8e4b8)
+                x_uint8 = x_clamped.to(tl.float8e4b8).to(tl.uint8, bitcast=True)
             else:
-                x_fp8 = x_clamped.to(tl.float8e4nv)
-            x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+                x_uint8 = float_to_e4m3_bytes(x_clamped, NATIVE_FP8)
 
             # Store as uint8 (1 byte each)
             tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
@@ -229,6 +234,7 @@ def quantize_and_insert_k_cache(
         fp8_max=FP8_MAX,
         n_quant_blocks=8,
         use_fnuz=use_fnuz,
+        NATIVE_FP8=has_native_fp8e4nv(),
     )
 
 
@@ -270,6 +276,7 @@ class DequantizeAndGatherKCacheKernel(
         fp8_max: tl.constexpr,
         n_quant_blocks: tl.constexpr,  # 7 real blocks
         use_fnuz: tl.constexpr = False,
+        NATIVE_FP8: tl.constexpr = True,
     ):
         batch_idx = tl.program_id(0)
         worker_id = tl.program_id(1)
@@ -333,12 +340,9 @@ class DequantizeAndGatherKCacheKernel(
 
                     # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere).
                     if use_fnuz:
-                        x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+                        x_float = x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.float32)
                     else:
-                        x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-
-                    # Convert fp8 to float32 for computation
-                    x_float = x_fp8.to(tl.float32)
+                        x_float = e4m3_bytes_to_float(x_uint8, NATIVE_FP8)
 
                     # Load and decode UE8M0 scale
                     # UE8M0: scale = 2^(stored_value - 127)
@@ -463,6 +467,7 @@ class DequantizeAndGatherKCacheKernel(
             block_size=compile_key.cache_block_size,
             offset=compile_key.offset,
             use_fnuz=compile_key.use_fnuz,
+            NATIVE_FP8=has_native_fp8e4nv(),
         )
 
     @kernel_launcher
@@ -544,6 +549,7 @@ def dequantize_and_gather_k_cache(
         block_size,
         offset,
         use_fnuz=use_fnuz,
+        NATIVE_FP8=has_native_fp8e4nv(),
     )
 
 

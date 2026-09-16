@@ -5,6 +5,10 @@
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.fp8_e4m3_portable import (
+    e4m3_bytes_to_float,
+    has_native_fp8e4nv,
+)
 
 # Paged decode: num_warps=4 dominated on A100/SM80 across {2,4,8}; the others
 # were 1.5–1.7× slower at (num_heads=32, head_dim=128, block_size=64), so
@@ -30,27 +34,15 @@ _PREFILL_WARMUP_M = 8
 _PREFILL_WARMUP_N = 8192
 
 
-_E4M3FN_BF16_LUT_CACHE: dict[torch.device, torch.Tensor] = {}
-
-
-def _get_e4m3fn_bf16_lut(device: torch.device) -> torch.Tensor:
-    lut = _E4M3FN_BF16_LUT_CACHE.get(device)
-    if lut is not None:
-        return lut
-    lut = (
-        torch.arange(256, dtype=torch.uint8, device=device)
-        .view(torch.float8_e4m3fn)
-        .to(torch.bfloat16)
-    )
-    lut[0x7F] = 480.0
-    lut[0xFF] = -480.0
-    _E4M3FN_BF16_LUT_CACHE[device] = lut
-    return lut
-
-
 @triton.jit
-def _decode_e4m3fn_bf16_lut(u, lut_ptr):
-    return tl.load(lut_ptr + u.to(tl.uint32))
+def _decode_e4m3fn_bf16(u, NATIVE_FP8: tl.constexpr):
+    """Decode E4M3 bytes to BF16.
+
+    A 256-entry lookup table would need a host-built tensor, and materializing
+    it on first use is an unpinned H2D copy that CUDA-graph capture rejects.
+    The bias-shift decode is table-free and bit-exact on every finite encoding.
+    """
+    return e4m3_bytes_to_float(u, NATIVE_FP8).to(tl.bfloat16)
 
 
 @triton.autotune(
@@ -63,7 +55,6 @@ def _fp8_paged_mqa_logits_kernel(
     kv_fp8_ptr,
     kv_scale_ptr,
     weights_ptr,
-    fp8_lut_ptr,
     context_lens_ptr,
     block_tables_ptr,
     logits_ptr,
@@ -89,6 +80,7 @@ def _fp8_paged_mqa_logits_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    NATIVE_FP8: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     block_rk = tl.program_id(1)
@@ -122,7 +114,7 @@ def _fp8_paged_mqa_logits_kernel(
         mask=mask_h[:, None] & mask_d[None, :],
         other=0,
     )
-    q = _decode_e4m3fn_bf16_lut(q_byte, fp8_lut_ptr)
+    q = _decode_e4m3fn_bf16(q_byte, NATIVE_FP8)
 
     kvf_base = kv_fp8_ptr + block_idx * stride_kvf_block
     k_byte = tl.load(
@@ -136,7 +128,7 @@ def _fp8_paged_mqa_logits_kernel(
         mask=mask_n,
         other=0.0,
     )
-    k = _decode_e4m3fn_bf16_lut(k_byte, fp8_lut_ptr)
+    k = _decode_e4m3fn_bf16(k_byte, NATIVE_FP8)
     # Scale in fp32 after the dot to avoid an extra bf16 round-trip on K.
     s = tl.dot(q, tl.trans(k)) * k_scale[None, :]
 
@@ -218,14 +210,12 @@ def fp8_paged_mqa_logits_triton(
     BLOCK_D = triton.next_power_of_2(head_dim)
     BLOCK_N = triton.next_power_of_2(block_size)
 
-    fp8_lut = _get_e4m3fn_bf16_lut(q.device)
     grid = (B * next_n, block_tables.shape[1])
     _fp8_paged_mqa_logits_kernel[grid](
         q_byte,
         kv_byte,
         kv_scale,
         weights,
-        fp8_lut,
         context_lens,
         block_tables,
         logits,
@@ -251,6 +241,7 @@ def fp8_paged_mqa_logits_triton(
         BLOCK_H=BLOCK_H,
         BLOCK_D=BLOCK_D,
         BLOCK_N=BLOCK_N,
+        NATIVE_FP8=has_native_fp8e4nv(),
     )
     return logits
 

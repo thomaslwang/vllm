@@ -45,6 +45,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.fp8_e4m3_portable import has_native_fp8e4nv
 from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -668,9 +669,20 @@ def sparse_attn_indexer(
                     q_scale[:num_decode_tokens], decode_lens, pad_value=0
                 )
             else:
-                padded_q_quant_decode_tokens = pack_seq_triton(
-                    q_quant[:num_decode_tokens], decode_lens
-                )
+                q_to_pack = q_quant[:num_decode_tokens]
+                if q_to_pack.dtype == torch.float8_e4m3fn and (
+                    not has_native_fp8e4nv()
+                ):
+                    # Triton rejects the fp8e4nv pointer type on sm_80/sm_86.
+                    # Packing is pure data movement, so move the bytes; the pad
+                    # value is immaterial because context_lens masks the slots.
+                    padded_q_quant_decode_tokens = pack_seq_triton(
+                        q_to_pack.view(torch.uint8), decode_lens, pad_value=0
+                    ).view(torch.float8_e4m3fn)
+                else:
+                    padded_q_quant_decode_tokens = pack_seq_triton(
+                        q_to_pack, decode_lens
+                    )
                 padded_q_scale = None
         else:
             padded_q_quant_decode_tokens = q_quant[:num_decode_tokens].reshape(
@@ -899,10 +911,13 @@ class SparseAttnIndexer(CustomOp):
                 _UNPACK_SEQ_TRITON_KERNEL,
             )
 
-            pack_dtype = torch.uint8 if use_fp4_cache else current_platform.fp8_dtype()
+            # sm_80/sm_86 pack FP8 Q through a uint8 view (Triton has no
+            # fp8e4nv there), so warm the dtype that will actually be used.
+            pack_bytes = use_fp4_cache or not has_native_fp8e4nv()
+            pack_dtype = torch.uint8 if pack_bytes else current_platform.fp8_dtype()
             _PACK_SEQ_TRITON_KERNEL.register_warmup(
                 dtype=pack_dtype,
-                pad_value=0 if use_fp4_cache else -float("inf"),
+                pad_value=0 if pack_bytes else -float("inf"),
             )
             _UNPACK_SEQ_TRITON_KERNEL.register_warmup()
 
