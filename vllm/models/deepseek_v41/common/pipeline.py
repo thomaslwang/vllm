@@ -105,5 +105,6 @@ def validate_local_sharing(dependencies: tuple[SharingDependency, ...]) -> None:
         )
         raise NotImplementedError(
             "DeepSeek V4.1 pipeline partition crosses layer-sharing dependencies: "
-            f"{detail}. Keep each sharing group on one pipeline stage."
+            f"{detail}. Keep each sharing group on one stage or explicitly enable "
+            "the experimental deepseek_v41_pp_sharing eager path."
         )
