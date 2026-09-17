@@ -15,7 +15,9 @@ the buffer proportional to ``tokens x topk`` rather than to the cache.
 
 import torch
 
-from vllm.models.deepseek_v41.ampere.sparse_attn import ampere_sparse_attn
+from vllm.models.deepseek_v41.ampere.sparse_attn_split import (
+    ampere_sparse_attn_split,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.fp8_e4m3_portable import (
     e4m3_bytes_to_float,
@@ -178,7 +180,7 @@ def ampere_sparse_decode(
         window.copy_(torch.where(idx >= 0, window, -1))
         col_offset += width
 
-    return ampere_sparse_attn(
+    return ampere_sparse_attn_split(
         q,
         kv.unsqueeze(1),
         flat_indices.unsqueeze(1),
