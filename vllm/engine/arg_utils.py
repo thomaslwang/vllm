@@ -583,6 +583,7 @@ class EngineArgs:
     allow_deprecated_quantization: bool = ModelConfig.allow_deprecated_quantization
     enforce_eager: bool = ModelConfig.enforce_eager
     disable_custom_all_reduce: bool = ParallelConfig.disable_custom_all_reduce
+    hier_all_reduce_islands: str = ParallelConfig.hier_all_reduce_islands
     language_model_only: bool = MultiModalConfig.language_model_only
     limit_mm_per_prompt: dict[str, int | dict[str, int]] = get_field(
         MultiModalConfig, "limit_per_prompt"
@@ -1247,6 +1248,10 @@ class EngineArgs:
         parallel_group.add_argument(
             "--disable-custom-all-reduce",
             **parallel_kwargs["disable_custom_all_reduce"],
+        )
+        parallel_group.add_argument(
+            "--hier-all-reduce-islands",
+            **parallel_kwargs["hier_all_reduce_islands"],
         )
         parallel_group.add_argument("--worker-cls", **parallel_kwargs["worker_cls"])
         parallel_group.add_argument(
@@ -2375,6 +2380,7 @@ class EngineArgs:
             expert_placement_strategy=self.expert_placement_strategy,
             max_parallel_loading_workers=self.max_parallel_loading_workers,
             disable_custom_all_reduce=self.disable_custom_all_reduce,
+            hier_all_reduce_islands=self.hier_all_reduce_islands,
             ray_workers_use_nsight=self.ray_workers_use_nsight,
             ray_runtime_env=ray_runtime_env,
             placement_group=placement_group,

@@ -26,6 +26,23 @@ from .base_device_communicator import DeviceCommunicatorBase
 logger = init_logger(__name__)
 
 
+def _hier_all_reduce_partition() -> str:
+    """Island partition for the hierarchical all-reduce.
+
+    Read from ParallelConfig, which is serialized to the workers;
+    VLLM_HIER_ALL_REDUCE remains as a fallback for callers that construct a
+    communicator outside an engine (and for `vllm serve`, whose engine-core
+    process does not inherit the launcher's environment).
+    """
+    try:
+        from vllm.config import get_current_vllm_config
+
+        partition = get_current_vllm_config().parallel_config.hier_all_reduce_islands
+    except Exception:
+        partition = ""
+    return partition or envs.VLLM_HIER_ALL_REDUCE
+
+
 class CudaCommunicator(DeviceCommunicatorBase):
     def __init__(
         self,
@@ -170,20 +187,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 self.use_aiter_ag_rs = True
 
         self.hier_ar_comm: HierarchicalAllReduce | None = None
-        if envs.VLLM_HIER_ALL_REDUCE and self.world_size > 1:
+        partition = _hier_all_reduce_partition()
+        if partition and self.world_size > 1:
             islands = [
-                [int(r) for r in part.split(",")]
-                for part in envs.VLLM_HIER_ALL_REDUCE.split(";")
+                [int(r) for r in part.split(",")] for part in partition.split(";")
             ]
             if sorted(r for i in islands for r in i) == list(range(self.world_size)):
+                logger.info("Using hierarchical all-reduce over islands %s.", partition)
                 self.hier_ar_comm = HierarchicalAllReduce(
                     self.cpu_group, self.device, islands
                 )
             else:
                 logger.warning(
-                    "VLLM_HIER_ALL_REDUCE=%s does not cover ranks 0..%d exactly; "
-                    "hierarchical allreduce disabled.",
-                    envs.VLLM_HIER_ALL_REDUCE,
+                    "Hierarchical all-reduce partition %s does not cover ranks "
+                    "0..%d exactly; disabled.",
+                    partition,
                     self.world_size - 1,
                 )
 

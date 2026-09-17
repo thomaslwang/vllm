@@ -214,6 +214,12 @@ class ParallelConfig:
     disable_custom_all_reduce: bool = False
     """Disable the custom all-reduce kernel and fall back to NCCL."""
 
+    hier_all_reduce_islands: str = ""
+    """Island partition enabling the hierarchical all-reduce, as
+    semicolon-separated rank groups, e.g. `"0,1,2,3;4,5,6,7"` for a 2x4 PCIe box
+    whose GPUs form two PIX islands bridged by the CPU interconnect. Empty
+    disables it. The partition must cover ranks `0..world_size-1` exactly."""
+
     enable_elastic_ep: bool = False
     """Enable elastic expert parallelism with stateless NCCL groups for DP/EP."""
     elastic_ep_max_dp_size: int = Field(default=None, ge=1)  # type: ignore[assignment]
