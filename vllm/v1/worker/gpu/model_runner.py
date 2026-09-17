@@ -1854,8 +1854,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
         if not self.is_first_pp_rank:
-            # Update for non-first PP ranks.
-            model_inputs["input_ids"] = None
+            # Update for non-first PP ranks. A model that declares it needs the
+            # raw tokens needs them on every stage, not just the first: DeepSeek
+            # V4.1's MoE gate routes image tokens off `input_ids` in every layer.
+            if not requires_raw_input_tokens(self.model):
+                model_inputs["input_ids"] = None
             model_inputs["inputs_embeds"] = None
 
             # Prepare the intermediate tensors.
